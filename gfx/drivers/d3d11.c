@@ -3646,12 +3646,19 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
    if (!d3d11)
       return false;
 
-   /*This implementation produces wrong result when using HDR*/
    #ifdef HAVE_DXGI_HDR
+   /*For HDR, disable tonemapping and dupe a frame*/
+   bool inverse_tonemap_enabled;
+   bool hdr10_enabled;
    if ((d3d11->flags & D3D11_ST_FLAG_HDR_ENABLE))
    {
-      RARCH_ERR("[D3D11]: HDR screenshot not supported.\n");
-      return false;
+      inverse_tonemap_enabled = d3d11->hdr.ubo_values.inverse_tonemap == 1.0f ? true : false;
+      hdr10_enabled = d3d11->hdr.ubo_values.hdr10 == 1.0f ? true : false;
+      if(inverse_tonemap_enabled)
+         d3d11_set_hdr_inverse_tonemap(d3d11, false);
+      if(hdr10_enabled)
+         d3d11_set_hdr10(d3d11, false);
+      video_driver_cached_frame();
    }
    #endif
 
@@ -3687,27 +3694,59 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
    d3d11->context->lpVtbl->Map(d3d11->context, BackBufferStaging, 0, D3D11_MAP_READ, 0, &Map);
    BackBufferData = (const uint8_t*)Map.pData;
 
-   /* Assuming format is DXGI_FORMAT_R8G8B8A8_UNORM */
-   if (StagingDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+   switch (StagingDesc.Format)
    {
-      BackBufferData += Map.RowPitch * d3d11->vp.y;
-      for (y = 0; y < d3d11->vp.height; y++, BackBufferData += Map.RowPitch)
-      {
-         bufferRow = buffer + 3 * (d3d11->vp.height - y - 1) * d3d11->vp.width;
-
-         for (x = 0; x < d3d11->vp.width; x++)
+      case DXGI_FORMAT_R8G8B8A8_UNORM:
+         BackBufferData += Map.RowPitch * d3d11->vp.y;
+         for (y = 0; y < d3d11->vp.height; y++, BackBufferData += Map.RowPitch)
          {
-            bufferRow[3 * x + 2] = BackBufferData[4 * (x + d3d11->vp.x) + 0];
-            bufferRow[3 * x + 1] = BackBufferData[4 * (x + d3d11->vp.x) + 1];
-            bufferRow[3 * x + 0] = BackBufferData[4 * (x + d3d11->vp.x) + 2];
+            bufferRow = buffer + 3 * (d3d11->vp.height - y - 1) * d3d11->vp.width;
+
+            for (x = 0; x < d3d11->vp.width; x++)
+            {
+               bufferRow[3 * x + 2] = BackBufferData[4 * (x + d3d11->vp.x) + 0];
+               bufferRow[3 * x + 1] = BackBufferData[4 * (x + d3d11->vp.x) + 1];
+               bufferRow[3 * x + 0] = BackBufferData[4 * (x + d3d11->vp.x) + 2];
+            }
          }
-      }
-      ret = true;
-   }
-   else
-   {
-      RARCH_ERR("[D3D11]: Unexpected swapchain format.\n");
-      ret = false;
+         ret = true;
+         break;
+#ifdef HAVE_DXGI_HDR
+      case DXGI_FORMAT_R10G10B10A2_UNORM:
+         BackBufferData += Map.RowPitch * d3d11->vp.y;
+         for (y = 0; y < d3d11->vp.height; y++, BackBufferData += Map.RowPitch)
+         {
+            bufferRow = buffer + 3 * (d3d11->vp.height - y - 1) * d3d11->vp.width;
+
+            for (x = 0; x < d3d11->vp.width; x++)
+            {
+               uint32_t pixel;
+               uint8_t r;
+               uint8_t g;
+               uint8_t b;
+
+               pixel = ((uint32_t*)BackBufferData)[x + d3d11->vp.x];
+               r = (pixel & 0x3FF00000) >> 22;
+               g = (pixel & 0x000FFC00) >> 12;
+               b = (pixel & 0x000003FF) >> 2;
+
+               bufferRow[3 * x + 2] = b;
+               bufferRow[3 * x + 1] = g;
+               bufferRow[3 * x + 0] = r;
+            }
+         }
+         ret = true;
+
+         if (hdr10_enabled)
+            d3d11_set_hdr10(d3d11, true);
+         if (inverse_tonemap_enabled)
+            d3d11_set_hdr_inverse_tonemap(d3d11, true);
+         break;
+#endif
+      default:
+         RARCH_ERR("[D3D11]: Unexpected swapchain format.\n");
+         ret = false;
+         break;
    }
 
    d3d11->context->lpVtbl->Unmap(d3d11->context, BackBufferStaging, 0);
