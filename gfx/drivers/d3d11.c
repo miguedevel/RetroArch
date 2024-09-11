@@ -3721,18 +3721,126 @@ static bool d3d11_gfx_read_viewport(void* data, uint8_t* buffer, bool is_idle)
             for (x = 0; x < d3d11->vp.width; x++)
             {
                uint32_t pixel;
-               uint8_t r;
-               uint8_t g;
-               uint8_t b;
+               uint8_t r, g, b;
 
                pixel = ((uint32_t*)BackBufferData)[x + d3d11->vp.x];
-               r = (pixel & 0x3FF00000) >> 22;
-               g = (pixel & 0x000FFC00) >> 12;
-               b = (pixel & 0x000003FF) >> 2;
 
-               bufferRow[3 * x + 2] = b;
-               bufferRow[3 * x + 1] = g;
+               /* Extract R, G, B components from R10G10B10A2 format */
+               r = (pixel >> 22) & 0x3FF;
+               g = (pixel >> 12) & 0x3FF;
+               b = (pixel >> 2) & 0x3FF;
+
+               if (!hdr10_enabled)
+               {
+                  float r_linear, g_linear, b_linear;
+                  float r_rec709, g_rec709, b_rec709;
+                  float r_norm, g_norm, b_norm;
+
+                  /* Normalize to[0, 1] */
+                  r_norm = r / 1023.0f;
+                  g_norm = g / 1023.0f;
+                  b_norm = b / 1023.0f;
+
+                  /* ST2084 to Linear conversion */
+                  r_linear = powf(fabsf(fmaxf(powf(fabsf(r_norm), 1.0f / 78.84375f) - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * powf(fabsf(r_norm), 1.0f / 78.84375f))), 1.0f / 0.1593017578f);
+                  g_linear = powf(fabsf(fmaxf(powf(fabsf(g_norm), 1.0f / 78.84375f) - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * powf(fabsf(g_norm), 1.0f / 78.84375f))), 1.0f / 0.1593017578f);
+                  b_linear = powf(fabsf(fmaxf(powf(fabsf(b_norm), 1.0f / 78.84375f) - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * powf(fabsf(b_norm), 1.0f / 78.84375f))), 1.0f / 0.1593017578f);
+
+                  /*  Calc the value that the HDR scene has to use to output a certain brightness */
+                  float max_nits = 10000.0f; /* Technically should divide by paperwhite nits here but it makes the image too dark*/
+                  r_linear *= max_nits; 
+                  g_linear *= max_nits; 
+                  b_linear *= max_nits;
+
+                  // Clamp values between 0 and 1
+                  r_linear = fminf(fmaxf(r_linear, 0.0f), 1.0f);
+                  g_linear = fminf(fmaxf(g_linear, 0.0f), 1.0f);
+                  b_linear = fminf(fmaxf(b_linear, 0.0f), 1.0f);
+
+                  if (d3d11->hdr.ubo_values.expand_gamut != 1.0f)
+                  {
+                     /* Matrix multiplication for Rec.709 conversion */
+                     r_rec709 = r_linear * 1.6604910f + g_linear * -0.5876411f + b_linear * -0.0728499f;
+                     g_rec709 = r_linear * -0.1245505f + g_linear * 1.1328999f + b_linear * -0.0083494f;
+                     b_rec709 = r_linear * -0.0181508f + g_linear * -0.1005789f + b_linear * 1.1187297f;
+                  }
+                  else
+                  {
+                     /* Matrix multiplication for expanded Rec.709 conversion */
+                     r_rec709 = r_linear * 1.63535f + g_linear * -0.57057f + b_linear * -0.0647755f;
+                     g_rec709 = r_linear * -0.0794803f + g_linear * 1.0898f + b_linear * -0.0103244f;
+                     b_rec709 = r_linear * 0.00343516f + g_linear * -0.020207f + b_linear * 1.01677f;
+                  }
+
+                  /* Clamp values between 0 and 1 */
+                  r_rec709 = fminf(fmaxf(r_rec709, 0.0f), 1.0f);
+                  g_rec709 = fminf(fmaxf(g_rec709, 0.0f), 1.0f);
+                  b_rec709 = fminf(fmaxf(b_rec709, 0.0f), 1.0f);
+
+                  /* Convert to 8 - bit */
+                  r = (uint8_t)(r_rec709 * 255.0f);
+                  g = (uint8_t)(g_rec709 * 255.0f);
+                  b = (uint8_t)(b_rec709 * 255.0f);
+
+                  if (!inverse_tonemap_enabled)
+                  {
+                     float luma, maxValue, elbow, offset;
+                     float hdrLumaTonemap, sdrLumaTonemap, lumaTonemap, perLuma_r, perLuma_g, perLuma_b;
+                     float hdrTonemap_r, hdrTonemap_g, hdrTonemap_b, sdrTonemap_r, sdrTonemap_g, sdrTonemap_b;
+                     float perChannel_r, perChannel_g, perChannel_b;
+                     float tonemap_r, tonemap_g, tonemap_b;
+
+                     /* Tonemapping */
+                     if (d3d11->hdr.ubo_values.expand_gamut != 1.0f)
+                        luma = r_rec709 * 0.2126f + g_rec709 * 0.7152f + b_rec709 * 0.0722f;
+                     else
+                        luma = r_rec709 * 0.215796f + g_rec709 * 0.702694f + b_rec709 * 0.120968f;
+                     maxValue = (d3d11->hdr.max_output_nits / d3d11->hdr.ubo_values.paper_white_nits) + 0.0001f; /* Defaults: (1000.0f / 200.0f) ; */
+                     elbow = maxValue / (maxValue - 1.0f);
+                     offset = 1.0f - ((0.5f * elbow) / (elbow - 0.5f));
+
+                     hdrLumaTonemap = elbow * (offset - luma) / (offset - luma - elbow + 0.0001f);
+                     sdrLumaTonemap = luma / (luma + 1.0f);
+                     lumaTonemap = luma >= 1.0f ? hdrLumaTonemap : sdrLumaTonemap;
+                     perLuma_r = r_rec709 / (luma + 0.0001f) * lumaTonemap;
+                     perLuma_g = g_rec709 / (luma + 0.0001f) * lumaTonemap;
+                     perLuma_b = b_rec709 / (luma + 0.0001f) * lumaTonemap;
+
+                     hdrTonemap_r = elbow * (offset - r_rec709) / (offset - r_rec709 - elbow + 0.0001f);
+                     hdrTonemap_g = elbow * (offset - g_rec709) / (offset - g_rec709 - elbow + 0.0001f);
+                     hdrTonemap_b = elbow * (offset - b_rec709) / (offset - b_rec709 - elbow + 0.0001f);
+                     sdrTonemap_r = r_rec709 / (r_rec709 + 1.0f);
+                     sdrTonemap_g = g_rec709 / (g_rec709 + 1.0f);
+                     sdrTonemap_b = b_rec709 / (b_rec709 + 1.0f);
+                     perChannel_r = r_rec709 > 1.0f ? hdrTonemap_r : sdrTonemap_r;
+                     perChannel_g = g_rec709 > 1.0f ? hdrTonemap_g : sdrTonemap_g;
+                     perChannel_b = b_rec709 > 1.0f ? hdrTonemap_b : sdrTonemap_b;
+
+                     tonemap_r = fminf(fmaxf((perLuma_r * 0.25f + perChannel_r * (1.0f - 0.25f)), 0.0f), 1.0f);
+                     tonemap_g = fminf(fmaxf((perLuma_g * 0.25f + perChannel_g * (1.0f - 0.25f)), 0.0f), 1.0f);
+                     tonemap_b = fminf(fmaxf((perLuma_b * 0.25f + perChannel_b * (1.0f - 0.25f)), 0.0f), 1.0f);
+
+                     /*Additional clamping after tonemapping*/
+                     tonemap_r = fminf(fmaxf(tonemap_r, 0.0f), 1.0f);
+                     tonemap_g = fminf(fmaxf(tonemap_g, 0.0f), 1.0f);
+                     tonemap_b = fminf(fmaxf(tonemap_b, 0.0f), 1.0f);
+
+                     /* Apply display gamma */
+                     tonemap_r = powf(tonemap_r, 2.2f / 2.0f); /* Should divide by contrast set in options. Default is 2.0*/
+                     tonemap_g = powf(tonemap_g, 2.2f / 2.0f); 
+                     tonemap_b = powf(tonemap_b, 2.2f / 2.0f);
+
+                     
+
+                     r = (uint8_t)(tonemap_r * 255.0f);
+                     g = (uint8_t)(tonemap_g * 255.0f);
+                     b = (uint8_t)(tonemap_b * 255.0f);
+                  }
+               }
+
                bufferRow[3 * x + 0] = r;
+               bufferRow[3 * x + 1] = g;
+               bufferRow[3 * x + 2] = b;
             }
          }
          ret = true;
